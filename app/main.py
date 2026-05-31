@@ -6,19 +6,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 
-from app.analytics import (
-    anomalies_response,
-    funnel_response,
-    health_response,
-    heatmap_response,
-    metrics_response,
-)
+from app.analytics import anomalies_response, funnel_response, health_response, heatmap_response, metrics_response
 from app.config import get_settings
 from app.db import StoreRepository
+from app.ingestion import ingest_batch
 from app.logging_config import configure_logging, request_logging_middleware
-from app.models import ErrorResponse, IngestRequest, IngestResult, StoreEvent
+from app.models import ErrorResponse, IngestRequest, IngestResult
 from app.pos import load_pos_transactions
 
 
@@ -47,20 +41,7 @@ async def sqlite_error_handler(request: Request, exc: sqlite3.Error) -> JSONResp
 
 @app.post("/events/ingest", response_model=IngestResult)
 def ingest_events(payload: IngestRequest) -> IngestResult:
-    accepted = 0
-    duplicate = 0
-    errors = []
-    for index, raw_event in enumerate(payload.events):
-        try:
-            event = StoreEvent.model_validate(raw_event)
-        except ValidationError as exc:
-            errors.append({"index": index, "error": exc.errors()})
-            continue
-        if repo.insert_event(event):
-            accepted += 1
-        else:
-            duplicate += 1
-    return IngestResult(accepted=accepted, duplicate=duplicate, rejected=len(errors), errors=errors)
+    return ingest_batch(repo, payload.events)
 
 
 @app.get("/stores/{id}/metrics")
