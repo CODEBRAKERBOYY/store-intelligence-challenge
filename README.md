@@ -4,7 +4,7 @@ This project turns the Brigade Road challenge dataset into a working offline sto
 
 ## Five-command setup
 
-1. Put the provided files in `/Users/alok/Documents` or set `DATA_DIR` to the directory that contains:
+1. Put the provided files in `./challenge_data` or set `DATA_DIR` to the directory that contains:
    - `CCTV Footage/CAM 1.mp4` through `CAM 5.mp4`
    - `Brigade_Bangalore_10_April_26 (1)bc6219c.csv`
    - `Brigade Road - Store layoutc5f5d56.xlsx`
@@ -14,7 +14,7 @@ This project turns the Brigade Road challenge dataset into a working offline sto
    ```
 3. Generate events from the clips and POS file:
    ```bash
-   DATA_DIR=/Users/alok/Documents docker compose run --rm api bash pipeline/run.sh
+   DATA_DIR=/path/to/challenge/files docker compose run --rm api bash pipeline/run.sh
    ```
 4. Ingest the generated events:
    ```bash

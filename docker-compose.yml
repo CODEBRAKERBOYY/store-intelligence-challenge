@@ -9,7 +9,7 @@ services:
       STORE_LAYOUT_PATH: "/data/Brigade Road - Store layoutc5f5d56.xlsx"
     volumes:
       - ./data:/app/data
-      - ${DATA_DIR:-/Users/alok/Documents}:/data:ro
+      - ${DATA_DIR:-./challenge_data}:/data:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 20s
