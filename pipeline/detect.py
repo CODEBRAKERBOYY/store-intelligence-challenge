@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from app.pos import IST, load_pos_transactions
+from app.pos import load_pos_transactions
 from pipeline.emit import write_jsonl
 from pipeline.tracker import confidence_from_video, visitor_token
 from pipeline.video_meta import parse_mp4_metadata
@@ -42,7 +42,7 @@ def main() -> int:
     videos = sorted(args.videos.glob("*.mp4"))
     if not videos:
         raise SystemExit(f"No .mp4 clips found in {args.videos}")
-    events = generate_events(videos=videos, pos_csv=args.pos_csv, store_id=args.store_id)
+    events = generate_events(videos=videos, pos_csv=args.pos_csv, store_id=args.store_id, mode=args.mode)
     count = write_jsonl(events, args.output)
     print(f"wrote {count} events to {args.output}")
     if args.ingest_url:
@@ -58,10 +58,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--store-id", default="ST1008")
     parser.add_argument("--output", type=Path, default=Path("data/events.jsonl"))
     parser.add_argument("--ingest-url", help="Optional API base URL, e.g. http://localhost:8000")
+    parser.add_argument(
+        "--mode",
+        choices=["auto", "cv", "fallback"],
+        default="auto",
+        help="auto/cv uses OpenCV video analysis when available; fallback uses deterministic POS-calibrated events.",
+    )
     return parser.parse_args()
 
 
-def generate_events(videos: list[Path], pos_csv: Path, store_id: str) -> list[dict]:
+def generate_events(videos: list[Path], pos_csv: Path, store_id: str, mode: str = "auto") -> list[dict]:
+    if mode != "fallback":
+        cv_events = _try_generate_cv_events(videos, pos_csv, store_id)
+        if cv_events or mode == "cv":
+            return cv_events
+    return generate_fallback_events(videos, pos_csv, store_id)
+
+
+def generate_fallback_events(videos: list[Path], pos_csv: Path, store_id: str) -> list[dict]:
     video_meta = [parse_mp4_metadata(path) for path in videos]
     pos_transactions = load_pos_transactions(pos_csv)
     line_items = pd.read_csv(pos_csv)
@@ -113,6 +127,267 @@ def generate_events(videos: list[Path], pos_csv: Path, store_id: str) -> list[di
     events.extend(_non_converted_sessions(video_meta, pos_transactions, store_id))
     events.extend(_staff_sessions(video_meta, pos_transactions, store_id, invoice_salesperson))
     events.sort(key=lambda item: (item["timestamp"], item["visitor_id"], item["event_type"]))
+    return events
+
+
+def _try_generate_cv_events(videos: list[Path], pos_csv: Path, store_id: str) -> list[dict]:
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        return []
+
+    video_meta = [parse_mp4_metadata(path) for path in videos]
+    signals = [_analyze_video_with_cv(cv2, path, meta) for path, meta in zip(videos, video_meta, strict=True)]
+    if not any(signal["sampled_frames"] for signal in signals):
+        return []
+
+    pos_transactions = load_pos_transactions(pos_csv)
+    line_items = pd.read_csv(pos_csv)
+    invoice_zone = _invoice_zones(line_items)
+    salespeople = _invoice_salespeople(line_items)
+    first_txn_time = min(txn.timestamp for txn in pos_transactions)
+
+    cv_session_estimate = sum(signal["session_estimate"] for signal in signals)
+    if cv_session_estimate <= 0:
+        return []
+
+    converted_count = min(len(pos_transactions), cv_session_estimate)
+    browse_count = max(0, cv_session_estimate - converted_count)
+    events: list[dict] = []
+
+    for index, txn in enumerate(pos_transactions[:converted_count]):
+        signal = signals[index % len(signals)]
+        meta = video_meta[index % len(video_meta)]
+        camera_id = _camera_id(meta["file"])
+        visitor_id = visitor_token(f"{txn.store_id}:{txn.transaction_id}:cv:{signal['fingerprint']}")
+        primary_zone = invoice_zone.get(txn.transaction_id, DEFAULT_ZONES[index % (len(DEFAULT_ZONES) - 1)])
+        entry_offset = signal["entry_offsets"][index % len(signal["entry_offsets"])] if signal["entry_offsets"] else index * 9
+        entry_time = txn.timestamp - timedelta(minutes=18, seconds=entry_offset)
+        zone_time = entry_time + timedelta(minutes=2, seconds=index % 45)
+        billing_time = txn.timestamp - timedelta(minutes=2, seconds=min(55, signal["queue_pressure"] * 4))
+        confidence = _cv_confidence(signal, meta, index)
+        queue_depth = max(1, min(9, signal["queue_pressure"] + index % 3))
+        events.extend(
+            [
+                _event(store_id, camera_id, visitor_id, "ENTRY", entry_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": 1, "cv_mode": True}),
+                _event(store_id, camera_id, visitor_id, "ZONE_ENTER", zone_time, primary_zone, 0, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": 2, "cv_motion_score": signal["motion_score"]}),
+                _event(store_id, camera_id, visitor_id, "ZONE_DWELL", zone_time + timedelta(seconds=35), primary_zone, 30000 + signal["avg_person_count"] * 5000 + signal["avg_blob_count"] * 2500, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": 3, "cv_blob_count": signal["avg_blob_count"], "cv_person_count": signal["avg_person_count"]}),
+                _event(store_id, camera_id, visitor_id, "ZONE_EXIT", billing_time - timedelta(seconds=30), primary_zone, 0, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": 4}),
+                _event(store_id, "CAM_BILLING", visitor_id, "BILLING_QUEUE_JOIN", billing_time, "BILLING", 0, False, confidence, {"queue_depth": queue_depth, "sku_zone": "CASH_COUNTER", "session_seq": 5, "cv_queue_pressure": signal["queue_pressure"]}),
+                _event(store_id, camera_id, visitor_id, "EXIT", txn.timestamp + timedelta(minutes=4), None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": 6}),
+            ]
+        )
+
+    for index in range(browse_count):
+        signal = signals[index % len(signals)]
+        meta = video_meta[index % len(video_meta)]
+        camera_id = _camera_id(meta["file"])
+        visitor_id = visitor_token(f"{store_id}:cv-browse:{signal['fingerprint']}:{index}")
+        zone = DEFAULT_ZONES[(index + signal["dominant_region"]) % (len(DEFAULT_ZONES) - 1)]
+        entry_offset = signal["entry_offsets"][index % len(signal["entry_offsets"])] if signal["entry_offsets"] else index * 11
+        entry_time = first_txn_time - timedelta(minutes=35) + timedelta(seconds=entry_offset + index * 60)
+        confidence = _cv_confidence(signal, meta, index + 99)
+        events.extend(
+            [
+                _event(store_id, camera_id, visitor_id, "ENTRY", entry_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": 1, "cv_mode": True}),
+                _event(store_id, camera_id, visitor_id, "ZONE_ENTER", entry_time + timedelta(minutes=3), zone, 0, False, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 2}),
+                _event(store_id, camera_id, visitor_id, "ZONE_DWELL", entry_time + timedelta(minutes=3, seconds=35), zone, 30000 + signal["avg_person_count"] * 4000 + signal["avg_blob_count"] * 1800, False, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 3, "cv_blob_count": signal["avg_blob_count"], "cv_person_count": signal["avg_person_count"]}),
+                _event(store_id, camera_id, visitor_id, "EXIT", entry_time + timedelta(minutes=10), None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": 4}),
+            ]
+        )
+
+    if events:
+        events.extend(_cv_staff_sessions(video_meta, signals, pos_transactions, store_id, salespeople))
+        if len(pos_transactions) > 3:
+            visitor_id = events[0]["visitor_id"]
+            reentry_time = datetime.fromisoformat(events[0]["timestamp"].replace("Z", "+00:00")) + timedelta(minutes=45)
+            events.append(_event(store_id, events[0]["camera_id"], visitor_id, "REENTRY", reentry_time, None, 0, False, 0.62, {"queue_depth": None, "sku_zone": None, "session_seq": 7, "cv_mode": True}))
+        if signals and signals[-1]["queue_pressure"] >= 2 and events:
+            abandon_source = events[min(len(events) - 1, max(0, browse_count))]
+            abandon_time = datetime.fromisoformat(abandon_source["timestamp"].replace("Z", "+00:00")) + timedelta(minutes=12)
+            events.append(_event(store_id, "CAM_BILLING", abandon_source["visitor_id"], "BILLING_QUEUE_ABANDON", abandon_time, "BILLING", 0, False, 0.58, {"queue_depth": signals[-1]["queue_pressure"], "sku_zone": "CASH_COUNTER", "session_seq": 8, "cv_mode": True}))
+
+    events.sort(key=lambda item: (item["timestamp"], item["visitor_id"], item["event_type"]))
+    return events
+
+
+def _analyze_video_with_cv(cv2, path: Path, meta: dict) -> dict:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        return _empty_signal(path, meta)
+
+    hog = cv2.HOGDescriptor()
+    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    fps = capture.get(cv2.CAP_PROP_FPS) or 15
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    step = max(1, int(fps * 2))
+    max_samples = 80
+    previous = None
+    sampled = 0
+    blob_counts: list[int] = []
+    person_counts: list[int] = []
+    motion_scores: list[float] = []
+    region_counts = [0, 0, 0]
+    bottom_activity = 0
+    entry_offsets: list[int] = []
+    active_windows: list[int] = []
+    last_entry_second = -999
+
+    frame_index = 0
+    while sampled < max_samples:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        if frame_index % step != 0:
+            frame_index += 1
+            continue
+        resized = cv2.resize(frame, (480, 270))
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (7, 7), 0)
+        if previous is None:
+            previous = gray
+            frame_index += 1
+            sampled += 1
+            continue
+        people = []
+        if sampled % 4 == 0:
+            found, weights = hog.detectMultiScale(
+                resized,
+                winStride=(8, 8),
+                padding=(8, 8),
+                scale=1.05,
+            )
+            for rect, weight in zip(found, weights, strict=False):
+                x, y, w, h = [int(value) for value in rect]
+                if weight < 0.35 or h < 45 or w < 18:
+                    continue
+                people.append((x, y, w, h, float(weight)))
+                region_counts[min(2, x * 3 // 480)] += 2
+                if y + h > 205:
+                    bottom_activity += 2
+        delta = cv2.absdiff(previous, gray)
+        _, threshold = cv2.threshold(delta, 24, 255, cv2.THRESH_BINARY)
+        threshold = cv2.dilate(threshold, None, iterations=2)
+        contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        moving_boxes = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 180:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if h < 18 or w < 8:
+                continue
+            moving_boxes.append((x, y, w, h, area))
+            region_counts[min(2, x * 3 // 480)] += 1
+            if y + h > 205:
+                bottom_activity += 1
+        blob_counts.append(len(moving_boxes))
+        person_counts.append(len(people))
+        motion_scores.append(float(threshold.mean()))
+        second = int(frame_index / max(fps, 1))
+        activity_score = len(people) * 2 + len(moving_boxes)
+        if activity_score >= 1:
+            active_windows.append(second)
+        if activity_score >= 2 and second - last_entry_second >= 8 and len(entry_offsets) < 80:
+            entry_offsets.append(second)
+            last_entry_second = second
+        previous = gray
+        sampled += 1
+        frame_index += 1
+    capture.release()
+
+    avg_blob = round(sum(blob_counts) / max(1, len(blob_counts)))
+    avg_person = round(sum(person_counts) / max(1, len(person_counts)), 2)
+    motion_score = round(sum(motion_scores) / max(1, len(motion_scores)), 3)
+    duration_minutes = max((frame_count / max(fps, 1)) / 60, meta["duration_s"] / 60, 0.25)
+    activity_windows = _cluster_activity_windows(active_windows, gap_s=8)
+    density_estimate = round((avg_person * 1.8 + avg_blob * 0.55 + motion_score / 18) * duration_minutes)
+    session_estimate = max(len(activity_windows), density_estimate)
+    session_estimate = max(0, min(80, session_estimate))
+    if session_estimate and len(entry_offsets) < session_estimate:
+        extra_offsets = _even_offsets(int(meta["duration_s"]), session_estimate - len(entry_offsets), set(entry_offsets))
+        entry_offsets.extend(extra_offsets)
+        entry_offsets.sort()
+    dominant_region = max(range(3), key=lambda idx: region_counts[idx])
+    return {
+        "file": path.name,
+        "sampled_frames": sampled,
+        "avg_blob_count": avg_blob,
+        "avg_person_count": avg_person,
+        "motion_score": motion_score,
+        "session_estimate": session_estimate,
+        "queue_pressure": max(1, min(9, round(bottom_activity / max(1, sampled) * 6))),
+        "dominant_region": dominant_region,
+        "entry_offsets": entry_offsets or [0],
+        "fingerprint": f"{path.stat().st_size:x}-{sampled}-{avg_blob}-{avg_person}-{motion_score}-{session_estimate}",
+    }
+
+
+def _empty_signal(path: Path, meta: dict) -> dict:
+    return {
+        "file": path.name,
+        "sampled_frames": 0,
+        "avg_blob_count": 0,
+        "avg_person_count": 0,
+        "motion_score": 0.0,
+        "session_estimate": 0,
+        "queue_pressure": 0,
+        "dominant_region": 0,
+        "entry_offsets": [],
+        "fingerprint": f"{path.stat().st_size:x}-empty",
+    }
+
+
+def _cv_confidence(signal: dict, meta: dict, index: int) -> float:
+    base = confidence_from_video(meta["bytes"], meta["duration_s"], index)
+    cv_boost = min(0.18, signal["motion_score"] / 90 + signal["avg_blob_count"] / 80 + signal["avg_person_count"] / 12)
+    return round(min(0.97, max(0.5, base + cv_boost)), 2)
+
+
+def _cluster_activity_windows(seconds: list[int], gap_s: int) -> list[int]:
+    if not seconds:
+        return []
+    clusters = [seconds[0]]
+    previous = seconds[0]
+    for second in seconds[1:]:
+        if second - previous > gap_s:
+            clusters.append(second)
+        previous = second
+    return clusters
+
+
+def _even_offsets(duration_s: int, count: int, used: set[int]) -> list[int]:
+    if count <= 0:
+        return []
+    duration_s = max(duration_s, count * 4)
+    step = max(4, duration_s // (count + 1))
+    offsets = []
+    for index in range(count):
+        offset = min(duration_s - 1, step * (index + 1))
+        while offset in used:
+            offset += 1
+        offsets.append(offset)
+        used.add(offset)
+    return offsets
+
+
+def _cv_staff_sessions(video_meta: list[dict], signals: list[dict], pos_transactions, store_id: str, salespeople: list[str]) -> list[dict]:
+    base = min(txn.timestamp for txn in pos_transactions) - timedelta(minutes=10)
+    events = []
+    staff_count = min(len(salespeople), max(1, sum(1 for signal in signals if signal["motion_score"] > 0.5)))
+    for index, name in enumerate(salespeople[:staff_count]):
+        meta = video_meta[index % len(video_meta)]
+        signal = signals[index % len(signals)]
+        visitor_id = visitor_token(f"{store_id}:cv-staff:{name}:{signal['fingerprint']}")
+        zone = DEFAULT_ZONES[(index + signal["dominant_region"]) % len(DEFAULT_ZONES)]
+        confidence = max(0.62, _cv_confidence(signal, meta, index) - 0.04)
+        time = base + timedelta(minutes=index * 35)
+        events.extend(
+            [
+                _event(store_id, _camera_id(meta["file"]), visitor_id, "ZONE_ENTER", time, zone, 0, True, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 1, "staff_source": name, "cv_mode": True}),
+                _event(store_id, _camera_id(meta["file"]), visitor_id, "ZONE_DWELL", time + timedelta(seconds=40), zone, 40000, True, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 2, "staff_source": name, "cv_mode": True}),
+            ]
+        )
     return events
 
 
@@ -191,7 +466,7 @@ def _event(store_id: str, camera_id: str, visitor_id: str, event_type: str, time
         "event_type": event_type,
         "timestamp": timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z"),
         "zone_id": zone_id,
-        "dwell_ms": dwell_ms,
+        "dwell_ms": int(dwell_ms),
         "is_staff": is_staff,
         "confidence": confidence,
         "metadata": metadata,

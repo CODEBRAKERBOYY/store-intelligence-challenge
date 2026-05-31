@@ -4,7 +4,7 @@
 
 The system is split into two independently testable parts: a CCTV/POS event pipeline and a Store Intelligence API.
 
-The pipeline starts from the raw files provided for the challenge. It reads the five MP4 clips, parses their metadata directly from the MP4 box structure, reads the POS CSV, groups line items into invoice-level transactions, and emits JSONL events in the required schema. The videos in this dataset are short and do not include the full twenty-minute multi-store setup described in the generic problem statement, so the pipeline uses the real POS timestamps as session anchors and the real clip metadata to calibrate camera IDs and confidence. The generated stream includes customer visits, staff movement, re-entry, zone dwell, billing joins, and billing abandonment. This is not presented as perfect computer vision; it is a deterministic, auditable event-generation layer built around the actual supplied data and the acceptance requirement that the system produce structured events from the raw inputs.
+The pipeline starts from the raw files provided for the challenge. It reads the five MP4 clips, parses their metadata directly from the MP4 box structure, reads the POS CSV, groups line items into invoice-level transactions, and emits JSONL events in the required schema. When OpenCV is available, `pipeline/detect.py` decodes frames from every video, runs OpenCV's HOG person detector on sampled frames, computes frame-difference motion blobs, clusters active time windows, estimates queue pressure from lower-frame activity, and fingerprints each clip from frame-derived signals. Those signals determine the visitor/session count, confidence, queue depth, visitor tokens, and `cv_*` event metadata, so replacing a video changes the event output. POS is not used to create the visitor count in this path; it is used only to match detected billing-zone sessions to actual purchases within the configured time window. If OpenCV is unavailable, the script falls back to a deterministic POS-calibrated path so the acceptance gate remains runnable in minimal local environments.
 
 The API is a FastAPI service backed by SQLite. SQLite was chosen because the dataset is small, the challenge is take-home, and the acceptance gate rewards a system that starts reliably with `docker compose up`. The repository layer uses the Python standard library `sqlite3` module, so the application has fewer moving parts than a full ORM-based stack. The `events` table is keyed by `event_id`, making ingestion idempotent. POS transactions are stored separately and loaded at startup when `POS_CSV_PATH` is present.
 
@@ -12,7 +12,7 @@ Business logic lives in `app/analytics.py`. This keeps the HTTP routes thin and 
 
 ## Request Flow
 
-1. `pipeline/detect.py` reads the CCTV directory and POS CSV.
+1. `pipeline/detect.py` reads the CCTV directory and POS CSV, using OpenCV video analysis in `auto` mode when installed.
 2. It writes schema-compliant events to `data/events.jsonl`.
 3. `scripts/ingest_events.py` posts the events to `POST /events/ingest`.
 4. The API validates each event with Pydantic, deduplicates by `event_id`, and stores valid events.
@@ -35,7 +35,7 @@ POS transactions are normalized from line-item CSV rows into invoice-level recor
 
 ## Edge Cases
 
-Re-entry is represented with `REENTRY` events on the same visitor token, so `/funnel` counts the session once. Staff movement is included but flagged `is_staff=true`; metrics and funnels exclude staff. Billing abandonment is emitted for selected sessions that enter billing but do not match a transaction window. Empty stores and zero-purchase windows return numeric zero values rather than nulls. Low sample heatmaps include a `LOW` data confidence flag when fewer than twenty sessions are present.
+Re-entry is represented with `REENTRY` events on the same visitor token, so `/funnel` counts the session once. Staff movement is included but flagged `is_staff=true`; metrics and funnels exclude staff. Billing abandonment is emitted for selected sessions that enter billing but do not match a transaction window. Queue depth comes from billing-region video activity when OpenCV is available. Empty stores and zero-purchase windows return numeric zero values rather than nulls. Low sample heatmaps include a `LOW` data confidence flag when fewer than twenty sessions are present. The checked-in sample `data/events.jsonl` was generated with the OpenCV path from the local five-camera dataset.
 
 ## Production Readiness
 

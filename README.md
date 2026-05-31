@@ -33,7 +33,8 @@ Using the bundled local Python runtime:
 /Users/alok/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m pipeline.detect \
   --videos "/Users/alok/Documents/CCTV Footage" \
   --pos-csv "/Users/alok/Documents/Brigade_Bangalore_10_April_26 (1)bc6219c.csv" \
-  --output data/events.jsonl
+  --output data/events.jsonl \
+  --mode auto
 
 STORE_DB_PATH=data/dev.db \
 POS_CSV_PATH="/Users/alok/Documents/Brigade_Bangalore_10_April_26 (1)bc6219c.csv" \
@@ -72,7 +73,7 @@ coverage run -m pytest
 coverage report --fail-under=70
 ```
 
-The pipeline tests use the real local dataset when it is mounted. If the licensed CCTV files are absent, those tests skip cleanly while the API/business-logic tests still run.
+The pipeline tests use the real local dataset when it is mounted. If the licensed CCTV files are absent, those tests skip cleanly while the API/business-logic tests still run. The Docker runtime installs OpenCV, so pipeline `--mode auto` performs video-dependent frame analysis; use `--mode fallback` only for debugging minimal environments.
 
 ## Dataset assumptions
 
