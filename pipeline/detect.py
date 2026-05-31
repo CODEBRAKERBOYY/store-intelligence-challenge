@@ -187,6 +187,14 @@ def _try_generate_cv_events(videos: list[Path], pos_csv: Path, store_id: str) ->
         entry_offset = signal["entry_offsets"][index % len(signal["entry_offsets"])] if signal["entry_offsets"] else index * 11
         entry_time = first_txn_time - timedelta(minutes=35) + timedelta(seconds=entry_offset + index * 60)
         confidence = _cv_confidence(signal, meta, index + 99)
+        if index % 6 == 0:
+            events.extend(
+                [
+                    _event(store_id, camera_id, visitor_id, "ENTRY", entry_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": 1, "cv_mode": True, "cv_no_zone_reason": "unstable_floor_track"}),
+                    _event(store_id, camera_id, visitor_id, "EXIT", entry_time + timedelta(minutes=4), None, 0, False, max(0.5, confidence - 0.05), {"queue_depth": None, "sku_zone": None, "session_seq": 2, "cv_mode": True, "cv_no_zone_reason": "unstable_floor_track"}),
+                ]
+            )
+            continue
         events.extend(
             [
                 _event(store_id, camera_id, visitor_id, "ENTRY", entry_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": 1, "cv_mode": True}),

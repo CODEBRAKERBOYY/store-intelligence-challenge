@@ -8,6 +8,7 @@ This project turns the Brigade Road challenge dataset into a working offline sto
    - `CCTV Footage/CAM 1.mp4` through `CAM 5.mp4`
    - `Brigade_Bangalore_10_April_26 (1)bc6219c.csv`
    - `Brigade Road - Store layoutc5f5d56.xlsx`
+   The Docker and pipeline scripts also discover generic `*.csv` POS files under `/data`, so the review dataset can use `pos_transactions.csv` without code changes.
 2. Start the API:
    ```bash
    docker compose up --build
@@ -27,24 +28,24 @@ This project turns the Brigade Road challenge dataset into a working offline sto
 
 ## Local development
 
-Using the bundled local Python runtime:
+Using any Python 3.12 environment with `requirements.txt` installed:
 
 ```bash
-/Users/alok/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m pipeline.detect \
-  --videos "/Users/alok/Documents/CCTV Footage" \
-  --pos-csv "/Users/alok/Documents/Brigade_Bangalore_10_April_26 (1)bc6219c.csv" \
+python -m pipeline.detect \
+  --videos "/path/to/challenge_data/CCTV Footage" \
+  --pos-csv "/path/to/challenge_data/pos_transactions.csv" \
   --output data/events.jsonl \
   --mode auto
 
 STORE_DB_PATH=data/dev.db \
-POS_CSV_PATH="/Users/alok/Documents/Brigade_Bangalore_10_April_26 (1)bc6219c.csv" \
-/Users/alok/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m uvicorn app.main:app --reload
+POS_CSV_PATH="/path/to/challenge_data/pos_transactions.csv" \
+python -m uvicorn app.main:app --reload
 ```
 
 Then ingest:
 
 ```bash
-/Users/alok/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 scripts/ingest_events.py
+python scripts/ingest_events.py
 ```
 
 ## API endpoints
@@ -73,7 +74,7 @@ coverage run -m pytest
 coverage report --fail-under=70
 ```
 
-The pipeline tests use the real local dataset when it is mounted. If the licensed CCTV files are absent, those tests skip cleanly while the API/business-logic tests still run. The Docker runtime installs OpenCV, so pipeline `--mode auto` performs video-dependent frame analysis; use `--mode fallback` only for debugging minimal environments.
+The default tests use synthetic MP4 and POS fixtures so coverage does not depend on licensed footage. To also run the real-footage smoke test, set `CHALLENGE_DATA_DIR=/path/to/challenge_data`. The Docker runtime installs OpenCV, so pipeline `--mode auto` performs video-dependent frame analysis; use `--mode fallback` only for debugging minimal environments.
 
 ## Dataset assumptions
 

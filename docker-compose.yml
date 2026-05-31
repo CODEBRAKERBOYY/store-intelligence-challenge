@@ -5,8 +5,8 @@ services:
       - "8000:8000"
     environment:
       STORE_DB_PATH: /app/data/store_intelligence.db
-      POS_CSV_PATH: "/data/Brigade_Bangalore_10_April_26 (1)bc6219c.csv"
-      STORE_LAYOUT_PATH: "/data/Brigade Road - Store layoutc5f5d56.xlsx"
+      POS_CSV_PATH: ${POS_CSV_PATH:-/data/pos_transactions.csv}
+      STORE_LAYOUT_PATH: ${STORE_LAYOUT_PATH:-/data/store_layout.json}
     volumes:
       - ./data:/app/data
       - ${DATA_DIR:-./challenge_data}:/data:ro
