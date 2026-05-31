@@ -14,11 +14,13 @@ from pipeline.detect import (
     _camera_id,
     _cluster_activity_windows,
     _cv_confidence,
+    _cv_staff_sessions,
     _empty_signal,
     _even_offsets,
     generate_events,
+    post_batches,
 )
-from pipeline.emit import write_jsonl
+from pipeline.emit import read_jsonl, write_jsonl
 from pipeline.video_meta import parse_mp4_metadata
 
 
@@ -58,6 +60,7 @@ def test_write_jsonl_creates_parent_and_serializes_events(tmp_path: Path):
 
     assert count == 2
     assert output.read_text().count("\n") == 2
+    assert read_jsonl(output) == events
 
 
 def test_cv_helper_functions_are_deterministic(tmp_path: Path):
@@ -75,6 +78,37 @@ def test_cv_helper_functions_are_deterministic(tmp_path: Path):
     assert _even_offsets(30, 3, {7}) == [8, 14, 21]
     assert _cv_confidence(signal, meta, 0) > 0.8
     assert _empty_signal(video, meta)["session_estimate"] == 0
+    assert _cluster_activity_windows([], gap_s=5) == []
+    assert _even_offsets(10, 0, set()) == []
+
+
+def test_cv_staff_sessions_and_post_batches(monkeypatch):
+    class Txn:
+        timestamp = __import__("datetime").datetime(2026, 4, 10, 8, 0, tzinfo=__import__("datetime").UTC)
+
+    video_meta = [{"file": "CAM 1.mp4", "bytes": 8_000_000, "duration_s": 120}]
+    signals = [{"fingerprint": "abc", "dominant_region": 1, "motion_score": 4.0, "avg_blob_count": 2, "avg_person_count": 1.0}]
+
+    staff_events = _cv_staff_sessions(video_meta, signals, [Txn()], "ST1008", ["Asha"])
+
+    assert len(staff_events) == 2
+    assert all(event["is_staff"] for event in staff_events)
+    assert staff_events[0]["metadata"]["cv_mode"] is True
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"accepted": 1, "duplicate": 2, "rejected": 3, "errors": [{"index": 0}]}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: FakeResponse())
+    result = post_batches("http://api/events/ingest", [{"event_id": "evt_1"}])
+
+    assert result == {"accepted": 1, "duplicate": 2, "rejected": 3, "errors": [{"index": 0}]}
 
 
 @pytest.mark.skipif(not os.getenv("CHALLENGE_DATA_DIR"), reason="set CHALLENGE_DATA_DIR to run against licensed local footage")
