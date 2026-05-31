@@ -1,0 +1,8 @@
+fastapi==0.136.3
+uvicorn[standard]==0.38.0
+pydantic==2.13.4
+pandas==2.2.3
+openpyxl==3.1.5
+pytest==9.0.3
+httpx==0.28.1
+coverage==7.14.1
