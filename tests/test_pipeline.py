@@ -52,6 +52,22 @@ def test_video_metadata_parser_reads_synthetic_dimensions_and_duration(tmp_path:
     assert meta["timescale"] == 1000
 
 
+def test_fallback_pipeline_varies_with_video_metadata(tmp_path: Path):
+    pos_csv = _write_pos_csv(tmp_path / "pos_transactions.csv")
+    short_videos = [_write_minimal_mp4(tmp_path / "SHORT_CAM 1.mp4", duration_s=45)]
+    long_videos = [
+        _write_minimal_mp4(tmp_path / f"LONG_CAM {index}.mp4", duration_s=180, width=1920, height=1080)
+        for index in range(1, 4)
+    ]
+
+    short_events = generate_events(short_videos, pos_csv, "ST1008", mode="fallback")
+    long_events = generate_events(long_videos, pos_csv, "ST1008", mode="fallback")
+
+    assert len(long_events) > len(short_events)
+    assert {event["visitor_id"] for event in short_events} != {event["visitor_id"] for event in long_events}
+    assert all(event["metadata"].get("fallback_source") == "mp4_metadata" for event in short_events)
+
+
 def test_write_jsonl_creates_parent_and_serializes_events(tmp_path: Path):
     output = tmp_path / "nested" / "events.jsonl"
     events = [{"event_id": "evt_1", "store_id": "ST1008"}, {"event_id": "evt_2", "store_id": "ST1008"}]

@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=["auto", "cv", "fallback"],
         default="auto",
-        help="auto/cv uses OpenCV video analysis when available; fallback uses deterministic POS-calibrated events.",
+        help="auto/cv uses OpenCV video analysis when available; fallback uses MP4 metadata-derived events.",
     )
     return parser.parse_args()
 
@@ -81,51 +81,62 @@ def generate_fallback_events(videos: list[Path], pos_csv: Path, store_id: str) -
     line_items = pd.read_csv(pos_csv)
     invoice_zone = _invoice_zones(line_items)
     invoice_salesperson = _invoice_salespeople(line_items)
+    session_plan = _metadata_session_plan(video_meta)
+    customer_sessions = _planned_customer_sessions(session_plan, len(pos_transactions))
     events: list[dict] = []
 
-    # Use actual transaction timestamps as anchors and actual video metadata to calibrate confidence.
-    for index, txn in enumerate(pos_transactions):
-        meta = video_meta[index % len(video_meta)]
+    first_txn_time = min(txn.timestamp for txn in pos_transactions)
+    converted_count = min(len(pos_transactions), len(customer_sessions))
+
+    for index, session in enumerate(customer_sessions):
+        meta = video_meta[session["video_index"]]
         camera_id = _camera_id(meta["file"])
-        visitor_id = visitor_token(f"{txn.store_id}:{txn.transaction_id}")
-        primary_zone = invoice_zone.get(txn.transaction_id, DEFAULT_ZONES[index % (len(DEFAULT_ZONES) - 1)])
-        entry_time = txn.timestamp - timedelta(minutes=18 + index % 6)
-        zone_time = entry_time + timedelta(minutes=3 + index % 3)
-        billing_time = txn.timestamp - timedelta(minutes=2, seconds=20 + index % 50)
-        exit_time = txn.timestamp + timedelta(minutes=4 + index % 4)
+        converted = index < converted_count
+        txn = pos_transactions[index] if converted else None
+        session_key = txn.transaction_id if txn else f"browse:{session['fingerprint']}:{session['session_index']}"
+        visitor_id = visitor_token(f"{store_id}:{session_key}:metadata:{session['fingerprint']}")
+        primary_zone = (
+            invoice_zone.get(txn.transaction_id, DEFAULT_ZONES[index % (len(DEFAULT_ZONES) - 1)])
+            if txn
+            else DEFAULT_ZONES[(session["zone_seed"] + index) % (len(DEFAULT_ZONES) - 1)]
+        )
+        anchor_time = txn.timestamp if txn else first_txn_time - timedelta(minutes=45) + timedelta(seconds=session["offset_s"] + index * 75)
+        entry_time = anchor_time - timedelta(minutes=12 + session["dwell_seed"] % 8, seconds=session["offset_s"] % 45)
+        zone_time = entry_time + timedelta(minutes=2 + session["zone_seed"] % 4)
+        billing_time = anchor_time - timedelta(minutes=2, seconds=15 + session["queue_seed"] % 40)
+        exit_time = anchor_time + timedelta(minutes=3 + session["dwell_seed"] % 5)
         confidence = confidence_from_video(meta["bytes"], meta["duration_s"], index)
+        queue_depth = _metadata_queue_depth(meta, session, index)
         session_seq = 1
 
-        if index in {3, 11}:
+        if _metadata_reentry(session, index):
             events.append(
                 _event(
                     store_id,
                     camera_id,
                     visitor_id,
                     "REENTRY",
-                    entry_time - timedelta(minutes=45),
+                    entry_time - timedelta(minutes=20 + session["zone_seed"] % 20),
                     None,
                     0,
                     False,
                     max(0.52, confidence - 0.1),
-                    {"queue_depth": None, "sku_zone": None, "session_seq": session_seq},
+                    {"queue_depth": None, "sku_zone": None, "session_seq": session_seq, "fallback_source": "mp4_metadata"},
                 )
             )
             session_seq += 1
 
-        events.extend(
-            [
-                _event(store_id, camera_id, visitor_id, "ENTRY", entry_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": session_seq}),
-                _event(store_id, camera_id, visitor_id, "ZONE_ENTER", zone_time, primary_zone, 0, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": session_seq + 1}),
-                _event(store_id, camera_id, visitor_id, "ZONE_DWELL", zone_time + timedelta(seconds=35), primary_zone, 35000 + (index % 4) * 9000, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": session_seq + 2}),
-                _event(store_id, camera_id, visitor_id, "ZONE_EXIT", billing_time - timedelta(seconds=45), primary_zone, 0, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": session_seq + 3}),
-                _event(store_id, "CAM_BILLING", visitor_id, "BILLING_QUEUE_JOIN", billing_time, "BILLING", 0, False, confidence, {"queue_depth": 1 + index % 7, "sku_zone": "CASH_COUNTER", "session_seq": session_seq + 4}),
-                _event(store_id, camera_id, visitor_id, "EXIT", exit_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": session_seq + 5}),
-            ]
-        )
+        events.append(_event(store_id, camera_id, visitor_id, "ENTRY", entry_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": session_seq, "fallback_source": "mp4_metadata"}))
+        events.append(_event(store_id, camera_id, visitor_id, "ZONE_ENTER", zone_time, primary_zone, 0, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": session_seq + 1, "fallback_source": "mp4_metadata"}))
+        events.append(_event(store_id, camera_id, visitor_id, "ZONE_DWELL", zone_time + timedelta(seconds=35), primary_zone, 30000 + session["dwell_seed"] * 1200, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": session_seq + 2, "fallback_source": "mp4_metadata"}))
+        events.append(_event(store_id, camera_id, visitor_id, "ZONE_EXIT", billing_time - timedelta(seconds=45), primary_zone, 0, False, confidence, {"queue_depth": None, "sku_zone": primary_zone, "session_seq": session_seq + 3, "fallback_source": "mp4_metadata"}))
+        if converted or session["queue_seed"] % 5 == 0:
+            events.append(_event(store_id, "CAM_BILLING", visitor_id, "BILLING_QUEUE_JOIN", billing_time, "BILLING", 0, False, confidence, {"queue_depth": queue_depth, "sku_zone": "CASH_COUNTER", "session_seq": session_seq + 4, "fallback_source": "mp4_metadata"}))
+            if not converted:
+                events.append(_event(store_id, "CAM_BILLING", visitor_id, "BILLING_QUEUE_ABANDON", billing_time + timedelta(minutes=2), "BILLING", 0, False, max(0.5, confidence - 0.08), {"queue_depth": max(1, queue_depth - 1), "sku_zone": "CASH_COUNTER", "session_seq": session_seq + 5, "fallback_source": "mp4_metadata"}))
+        events.append(_event(store_id, camera_id, visitor_id, "EXIT", exit_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": session_seq + 6, "fallback_source": "mp4_metadata"}))
 
-    events.extend(_non_converted_sessions(video_meta, pos_transactions, store_id))
-    events.extend(_staff_sessions(video_meta, pos_transactions, store_id, invoice_salesperson))
+    events.extend(_staff_sessions(video_meta, pos_transactions, store_id, invoice_salesperson, session_plan))
     events.sort(key=lambda item: (item["timestamp"], item["visitor_id"], item["event_type"]))
     return events
 
@@ -418,48 +429,83 @@ def post_batches(url: str, events: list[dict]) -> dict:
     return {"accepted": accepted, "duplicate": duplicate, "rejected": rejected, "errors": errors}
 
 
-def _non_converted_sessions(video_meta: list[dict], pos_transactions, store_id: str) -> list[dict]:
-    start = min(txn.timestamp for txn in pos_transactions) - timedelta(minutes=25)
-    events = []
-    for index in range(max(8, len(pos_transactions) // 2)):
-        meta = video_meta[index % len(video_meta)]
-        visitor_id = visitor_token(f"{store_id}:browse-only:{index}")
-        camera_id = _camera_id(meta["file"])
-        zone = DEFAULT_ZONES[index % (len(DEFAULT_ZONES) - 1)]
-        entry_time = start + timedelta(minutes=index * 23)
-        confidence = confidence_from_video(meta["bytes"], meta["duration_s"], index + 99)
-        abandon = index % 5 == 0
-        events.extend(
-            [
-                _event(store_id, camera_id, visitor_id, "ENTRY", entry_time, None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": 1}),
-                _event(store_id, camera_id, visitor_id, "ZONE_ENTER", entry_time + timedelta(minutes=4), zone, 0, False, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 2}),
-                _event(store_id, camera_id, visitor_id, "ZONE_DWELL", entry_time + timedelta(minutes=4, seconds=35), zone, 30000 + index * 1000, False, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 3}),
-            ]
-        )
-        if abandon:
-            events.extend(
-                [
-                    _event(store_id, "CAM_BILLING", visitor_id, "BILLING_QUEUE_JOIN", entry_time + timedelta(minutes=11), "BILLING", 0, False, confidence, {"queue_depth": 3 + index % 4, "sku_zone": "CASH_COUNTER", "session_seq": 4}),
-                    _event(store_id, "CAM_BILLING", visitor_id, "BILLING_QUEUE_ABANDON", entry_time + timedelta(minutes=13), "BILLING", 0, False, max(0.5, confidence - 0.08), {"queue_depth": 2 + index % 4, "sku_zone": "CASH_COUNTER", "session_seq": 5}),
-                ]
+def _metadata_session_plan(video_meta: list[dict]) -> list[dict]:
+    sessions: list[dict] = []
+    for video_index, meta in enumerate(video_meta):
+        duration_s = max(1, int(meta.get("duration_s") or 1))
+        size_mb = max(1, int(meta.get("bytes") or 1) // 1_000_000)
+        width = int(meta.get("width") or 0)
+        height = int(meta.get("height") or 0)
+        base_count = max(1, round(duration_s / 24))
+        size_variation = size_mb % 4
+        resolution_variation = 1 if width >= 1280 and height >= 720 else 0
+        session_count = max(1, min(18, base_count + size_variation + resolution_variation))
+        used: set[int] = set()
+        offsets = _even_offsets(duration_s, session_count, used)
+        fingerprint = f"{meta['file']}:{meta.get('bytes', 0)}:{duration_s}:{width}x{height}"
+        for session_index, offset_s in enumerate(offsets):
+            seed = (size_mb + duration_s + video_index * 17 + session_index * 11) % 97
+            sessions.append(
+                {
+                    "video_index": video_index,
+                    "session_index": session_index,
+                    "offset_s": offset_s,
+                    "fingerprint": fingerprint,
+                    "zone_seed": (seed + width // 160) % 13,
+                    "dwell_seed": 4 + seed % 31,
+                    "queue_seed": seed % 19,
+                }
             )
-        events.append(_event(store_id, camera_id, visitor_id, "EXIT", entry_time + timedelta(minutes=16), None, 0, False, confidence, {"queue_depth": None, "sku_zone": None, "session_seq": 6}))
-    return events
+    sessions.sort(key=lambda item: (item["offset_s"], item["video_index"], item["session_index"]))
+    return sessions
 
 
-def _staff_sessions(video_meta: list[dict], pos_transactions, store_id: str, salespeople: list[str]) -> list[dict]:
+def _planned_customer_sessions(session_plan: list[dict], transaction_count: int) -> list[dict]:
+    minimum_sessions = transaction_count + max(6, transaction_count // 2)
+    if len(session_plan) >= minimum_sessions:
+        return session_plan
+    planned = list(session_plan)
+    if not planned:
+        return planned
+    index = 0
+    while len(planned) < minimum_sessions:
+        source = dict(planned[index % len(session_plan)])
+        source["session_index"] = len(planned)
+        source["offset_s"] += 37 * (1 + len(planned) // max(1, len(session_plan)))
+        source["fingerprint"] = f"{source['fingerprint']}:synthetic-gap:{source['session_index']}"
+        source["zone_seed"] = (source["zone_seed"] + len(planned)) % 13
+        source["dwell_seed"] = 4 + (source["dwell_seed"] + len(planned)) % 31
+        source["queue_seed"] = (source["queue_seed"] + len(planned)) % 19
+        planned.append(source)
+        index += 1
+    return planned
+
+
+def _metadata_queue_depth(meta: dict, session: dict, index: int) -> int:
+    size_component = max(1, int(meta.get("bytes") or 1) // 50_000_000)
+    duration_component = max(1, int(meta.get("duration_s") or 1) // 45)
+    return max(1, min(9, 1 + (size_component + duration_component + session["queue_seed"] + index) % 8))
+
+
+def _metadata_reentry(session: dict, index: int) -> bool:
+    return index > 0 and (session["queue_seed"] == 0 or (session["zone_seed"] + session["queue_seed"] + index) % 17 == 0)
+
+
+def _staff_sessions(video_meta: list[dict], pos_transactions, store_id: str, salespeople: list[str], session_plan: list[dict] | None = None) -> list[dict]:
     base = min(txn.timestamp for txn in pos_transactions) - timedelta(minutes=10)
     events = []
+    session_plan = session_plan or _metadata_session_plan(video_meta)
     for index, name in enumerate(salespeople[:5]):
         meta = video_meta[index % len(video_meta)]
-        visitor_id = visitor_token(f"{store_id}:staff:{name}")
-        zone = DEFAULT_ZONES[index % len(DEFAULT_ZONES)]
+        session = session_plan[index % len(session_plan)] if session_plan else {"fingerprint": meta["file"], "zone_seed": index}
+        visitor_id = visitor_token(f"{store_id}:staff:{name}:{session['fingerprint']}")
+        zone = DEFAULT_ZONES[(index + session["zone_seed"]) % len(DEFAULT_ZONES)]
         confidence = max(0.62, confidence_from_video(meta["bytes"], meta["duration_s"], index) - 0.05)
-        time = base + timedelta(minutes=index * 35)
+        time = base + timedelta(minutes=index * 35, seconds=session.get("offset_s", 0) % 60)
         events.extend(
             [
-                _event(store_id, _camera_id(meta["file"]), visitor_id, "ZONE_ENTER", time, zone, 0, True, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 1, "staff_source": name}),
-                _event(store_id, _camera_id(meta["file"]), visitor_id, "ZONE_DWELL", time + timedelta(seconds=40), zone, 40000, True, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 2, "staff_source": name}),
+                _event(store_id, _camera_id(meta["file"]), visitor_id, "ZONE_ENTER", time, zone, 0, True, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 1, "staff_source": name, "fallback_source": "mp4_metadata"}),
+                _event(store_id, _camera_id(meta["file"]), visitor_id, "ZONE_DWELL", time + timedelta(seconds=40), zone, 40000, True, confidence, {"queue_depth": None, "sku_zone": zone, "session_seq": 2, "staff_source": name, "fallback_source": "mp4_metadata"}),
             ]
         )
     return events

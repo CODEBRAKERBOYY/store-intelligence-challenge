@@ -4,11 +4,12 @@ This project turns the Brigade Road challenge dataset into a working offline sto
 
 ## Five-command setup
 
-1. Put the provided files in `./challenge_data` or set `DATA_DIR` to the directory that contains:
+1. Put the provided challenge files in `./challenge_data` or set `DATA_DIR` to a clean directory that contains only the challenge dataset:
    - `CCTV Footage/CAM 1.mp4` through `CAM 5.mp4`
    - `Brigade_Bangalore_10_April_26 (1)bc6219c.csv`
    - `Brigade Road - Store layoutc5f5d56.xlsx`
-   The Docker and pipeline scripts also discover generic `*.csv` POS files under `/data`, so the review dataset can use `pos_transactions.csv` without code changes.
+
+   If you receive `CCTV Footage.zip`, unzip it so the MP4 files live under `challenge_data/CCTV Footage/`. The Docker and pipeline scripts also discover generic `*.csv` POS files under `/data`, so the review dataset can use `pos_transactions.csv` without code changes. If your dataset directory contains unrelated CSV files, set `POS_CSV` explicitly.
 2. Start the API:
    ```bash
    docker compose up --build
@@ -16,6 +17,15 @@ This project turns the Brigade Road challenge dataset into a working offline sto
 3. Generate events from the clips and POS file:
    ```bash
    DATA_DIR=/path/to/challenge/files docker compose run --rm api bash pipeline/run.sh
+   ```
+
+   For a mixed local directory, use explicit paths:
+
+   ```bash
+   DATA_DIR=/path/to/challenge/files \
+   VIDEOS_DIR="/data/CCTV Footage" \
+   POS_CSV="/data/Brigade_Bangalore_10_April_26 (1)bc6219c.csv" \
+   docker compose run --rm api bash pipeline/run.sh
    ```
 4. Ingest the generated events:
    ```bash
